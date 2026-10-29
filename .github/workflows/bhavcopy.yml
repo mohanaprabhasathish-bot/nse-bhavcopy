@@ -20,6 +20,11 @@ on:
         description: "Backfill TO DD-MM-YYYY"
         required: false
         default: ""
+      refresh_securities:
+        description: "Force refresh of securities list (company name / listing date / ISIN)"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: bhavcopy
@@ -46,5 +51,6 @@ jobs:
           INPUT_DATE: ${{ github.event.inputs.date }}
           INPUT_FROM: ${{ github.event.inputs.from_date }}
           INPUT_TO: ${{ github.event.inputs.to_date }}
+          INPUT_REFRESH_SEC: ${{ github.event.inputs.refresh_securities }}
           EVENT_NAME: ${{ github.event_name }}
         run: python fetch_bhavcopy.py
