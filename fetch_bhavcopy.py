@@ -1,5 +1,6 @@
 """
 NSE Full Bhavcopy & Security Deliverable data  ->  Google Sheet (via Apps Script web app)
+Also keeps NSE's securities master (EQUITY_L.csv: company name, listing date, ISIN) in the sheet.
 
 Runs inside GitHub Actions. Modes (chosen from workflow inputs):
   - Scheduled run          -> latest trading day whose file should be out (see below),
@@ -9,11 +10,13 @@ Runs inside GitHub Actions. Modes (chosen from workflow inputs):
   - Manual, nothing given  -> latest trading day, re-loaded
 
 "Latest trading day" (IST): today if it is 6 PM or later, otherwise the previous weekday.
-So a run delayed past midnight still loads the right day.
+Securities master is refreshed on the first run of each day (or when refresh_securities=true),
+BEFORE bhavcopy rows are loaded, so new rows get company name / listing date / ISIN.
 
 Env vars:
   SHEET_WEBAPP_URL, SHEET_TOKEN          (GitHub secrets)
   INPUT_DATE, INPUT_FROM, INPUT_TO       (DD-MM-YYYY, optional)
+  INPUT_REFRESH_SEC                      ("true" to force a securities refresh)
   EVENT_NAME                             (schedule / workflow_dispatch)
 """
 
@@ -29,6 +32,8 @@ TOKEN = os.environ["SHEET_TOKEN"].strip()
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 HOSTS = ["https://nsearchives.nseindia.com", "https://archives.nseindia.com"]
+BHAV_PATH = "/products/content/sec_bhavdata_full_{key}.csv"
+SEC_PATH = "/content/equities/EQUITY_L.csv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -63,12 +68,11 @@ def new_session():
     return s
 
 
-def fetch(session, d):
-    """Returns (status, csv_text, message). status: OK / NO_FILE / ERROR"""
-    key = d.strftime("%d%m%Y")
+def fetch_path(session, path):
+    """Returns (status, text, message). status: OK / NO_FILE / ERROR"""
     last = "no attempt"
     for host in HOSTS:
-        url = f"{host}/products/content/sec_bhavdata_full_{key}.csv"
+        url = host + path
         for attempt in range(3):
             try:
                 r = session.get(url, timeout=30)
@@ -87,7 +91,7 @@ def fetch(session, d):
 
 def call_sheet(payload):
     payload["token"] = TOKEN
-    r = requests.post(WEBAPP_URL, json=payload, timeout=180)
+    r = requests.post(WEBAPP_URL, json=payload, timeout=300)
     try:
         res = r.json()
     except ValueError:
@@ -95,6 +99,21 @@ def call_sheet(payload):
     if not res.get("ok"):
         raise RuntimeError(f"Web app error: {res.get('error')}")
     return res
+
+
+def refresh_securities(session, force):
+    """Download EQUITY_L.csv and replace the Securities tab (once per day unless forced)."""
+    today = dt.datetime.now(IST).date().isoformat()
+    if not force and call_sheet({"action": "sec_status"}).get("updated") == today:
+        print("Securities master: already refreshed today")
+        return True
+    status, text, msg = fetch_path(session, SEC_PATH)
+    if status != "OK":
+        print(f"WARNING: could not download EQUITY_L.csv ({msg}) - using existing Securities tab")
+        return False
+    res = call_sheet({"action": "securities", "csv": text})
+    print(f"Securities master: refreshed, {res.get('rows')} securities")
+    return True
 
 
 def latest_trading_day(now_ist):
@@ -121,7 +140,7 @@ def process(session, d, force, mode, quiet_no_file=False):
         print(f"{iso}: already loaded, skipped")
         return "SKIPPED"
 
-    status, text, msg = fetch(session, d)
+    status, text, msg = fetch_path(session, BHAV_PATH.format(key=d.strftime("%d%m%Y")))
     if status == "NO_FILE" and quiet_no_file:
         print(f"{iso}: no file (holiday?) - not logged")   # avoids log spam on holidays
         return "NO_FILE"
@@ -135,6 +154,7 @@ def main():
     one = parse_input(os.environ.get("INPUT_DATE"))
     frm = parse_input(os.environ.get("INPUT_FROM"))
     to = parse_input(os.environ.get("INPUT_TO"))
+    force_sec = (os.environ.get("INPUT_REFRESH_SEC") or "").strip().lower() == "true"
     scheduled = os.environ.get("EVENT_NAME") == "schedule"
     now = dt.datetime.now(IST)
     print(f"Run started {now:%Y-%m-%d %H:%M} IST ({os.environ.get('EVENT_NAME')})")
@@ -158,6 +178,8 @@ def main():
         jobs, force, mode = [latest_trading_day(now)], True, "MANUAL"
 
     session = new_session()
+    refresh_securities(session, force_sec)
+
     results = []
     for i, d in enumerate(jobs):
         results.append(process(session, d, force, mode, quiet_no_file=d in quiet))
