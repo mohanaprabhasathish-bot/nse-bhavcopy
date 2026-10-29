@@ -2,10 +2,14 @@
 NSE Full Bhavcopy & Security Deliverable data  ->  Google Sheet (via Apps Script web app)
 
 Runs inside GitHub Actions. Modes (chosen from workflow inputs):
-  - Scheduled run          -> today's file (IST), skipped if already in the sheet
+  - Scheduled run          -> latest trading day whose file should be out (see below),
+                              plus a catch-up of the previous 3 weekdays if any are missing
   - Manual, date given     -> that date, always re-loaded (replaces existing rows)
   - Manual, from/to given  -> backfill weekdays in range, skips dates already loaded
-  - Manual, nothing given  -> today's file, re-loaded
+  - Manual, nothing given  -> latest trading day, re-loaded
+
+"Latest trading day" (IST): today if it is 6 PM or later, otherwise the previous weekday.
+So a run delayed past midnight still loads the right day.
 
 Env vars:
   SHEET_WEBAPP_URL, SHEET_TOKEN          (GitHub secrets)
@@ -32,7 +36,9 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
 }
-BACKFILL_DELAY = 2  # seconds between NSE requests
+BACKFILL_DELAY = 2      # seconds between NSE requests
+PUBLISH_HOUR_IST = 18   # before this hour, today's file is not expected yet
+CATCHUP_DAYS = 3        # scheduled runs also fill gaps in the previous N weekdays
 
 
 def parse_input(s):
@@ -91,13 +97,34 @@ def call_sheet(payload):
     return res
 
 
-def process(session, d, force, mode):
+def latest_trading_day(now_ist):
+    d = now_ist.date()
+    if now_ist.hour < PUBLISH_HOUR_IST:
+        d -= dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def previous_weekdays(d, n):
+    out = []
+    while len(out) < n:
+        d -= dt.timedelta(days=1)
+        if d.weekday() < 5:
+            out.append(d)
+    return sorted(out)
+
+
+def process(session, d, force, mode, quiet_no_file=False):
     iso = d.isoformat()
     if not force and call_sheet({"action": "check", "date": iso}).get("loaded"):
         print(f"{iso}: already loaded, skipped")
         return "SKIPPED"
 
     status, text, msg = fetch(session, d)
+    if status == "NO_FILE" and quiet_no_file:
+        print(f"{iso}: no file (holiday?) - not logged")   # avoids log spam on holidays
+        return "NO_FILE"
     res = call_sheet({"action": "load", "date": iso, "status": status, "csv": text,
                       "message": msg, "force": force, "mode": mode})
     print(f"{iso}: {res.get('status')} rows={res.get('rows')} {res.get('msg', '')}")
@@ -109,7 +136,9 @@ def main():
     frm = parse_input(os.environ.get("INPUT_FROM"))
     to = parse_input(os.environ.get("INPUT_TO"))
     scheduled = os.environ.get("EVENT_NAME") == "schedule"
-    today = dt.datetime.now(IST).date()
+    now = dt.datetime.now(IST)
+    print(f"Run started {now:%Y-%m-%d %H:%M} IST ({os.environ.get('EVENT_NAME')})")
+    quiet = set()
 
     if one:
         jobs, force, mode = [one], True, "MANUAL"
@@ -120,16 +149,18 @@ def main():
         jobs = [frm + dt.timedelta(n) for n in range(days)]
         jobs = [d for d in jobs if d.weekday() < 5]
         force, mode = False, "BACKFILL"
+    elif scheduled:
+        target = latest_trading_day(now)
+        catchup = previous_weekdays(target, CATCHUP_DAYS)
+        quiet = set(catchup)
+        jobs, force, mode = catchup + [target], False, "AUTO"
     else:
-        if today.weekday() >= 5:
-            print("Weekend - nothing to do.")
-            return
-        jobs, force, mode = [today], not scheduled, "AUTO" if scheduled else "MANUAL"
+        jobs, force, mode = [latest_trading_day(now)], True, "MANUAL"
 
     session = new_session()
     results = []
     for i, d in enumerate(jobs):
-        results.append(process(session, d, force, mode))
+        results.append(process(session, d, force, mode, quiet_no_file=d in quiet))
         if mode == "BACKFILL" and i < len(jobs) - 1 and results[-1] != "SKIPPED":
             time.sleep(BACKFILL_DELAY)
 
