@@ -2,8 +2,10 @@ name: NSE Bhavcopy to Sheet
 
 on:
   schedule:
-    - cron: "0 14 * * 1-5"   # 19:30 IST, Mon-Fri
-    - cron: "0 16 * * 1-5"   # 21:30 IST, Mon-Fri (retry if file was late)
+    # GitHub cron is always UTC.  IST = UTC + 5:30
+    - cron: "17 14 * * 1-5"  # 19:47 IST Mon-Fri
+    - cron: "47 15 * * 1-5"  # 21:17 IST Mon-Fri (retry)
+    - cron: "13 2 * * 2-6"   # 07:43 IST Tue-Sat (backup: loads previous trading day if evening runs were late/skipped)
   workflow_dispatch:
     inputs:
       date:
@@ -28,9 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
